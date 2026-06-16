@@ -1,0 +1,57 @@
+# MediaMTX configuration for POC
+# https://github.com/bluenviron/mediamtx
+
+# Default port
+port: 8554
+
+# Paths configuration
+paths:
+  # Default path catch-all
+  all:
+    # No authentication required for POC
+    readUser: ""
+    readPass: ""
+    writeUser: ""
+    writePass: ""
+    # Run a source process
+    runOnInit: ""
+    runOnInitRestart: false
+    # Maximum number of readers
+    maxReaders: 0
+
+  # Camera 1 - will receive looped video feed
+  cam01:
+    readUser: ""
+    readPass: ""
+    writeUser: ""
+    writePass: ""
+
+  # Camera 2 - for testing dual camera setup
+  cam02:
+    readUser: ""
+    readPass: ""
+    writeUser: ""
+    writePass: ""
+
+# RTCP is used by cameras to return network feedback
+rtcp: true
+
+# RTSPS (RTSP over TLS) - disabled for POC
+rtsp:
+  enabled: true
+  port: 8554
+
+# RTMP (optional, for ingest)
+rtmp:
+  enabled: true
+  port: 1935
+
+# HLS (optional for browser playback)
+hls:
+  enabled: true
+  port: 8888
+
+# WebRTC (optional for low-latency)
+webrtc:
+  enabled: true
+  port: 8889

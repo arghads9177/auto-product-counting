@@ -19,6 +19,8 @@ class _WorkerManager:
         self._queue: multiprocessing.Queue = multiprocessing.Queue()
         # Per-camera MJPEG frame queues (maxsize=2 for drop-to-latest semantics)
         self._frame_queues: dict[str, multiprocessing.Queue] = {}
+        # In-memory count totals per camera; Phase 5 adds MongoDB persistence
+        self._counts: dict[str, dict[str, int]] = {}  # camera_id → {loading, unloading}
 
     @property
     def event_queue(self) -> multiprocessing.Queue:
@@ -61,6 +63,37 @@ class _WorkerManager:
     def update_status(self, camera_id: str, status: str) -> None:
         if camera_id in self._cameras:
             self._cameras[camera_id]["status"] = status
+
+    def on_count_event(self, event: dict) -> None:
+        """Accumulate a count_event emitted by a worker process."""
+        cid = event.get("camera_id")
+        if not cid:
+            return
+        bucket = self._counts.setdefault(cid, {"loading": 0, "unloading": 0})
+        direction = event.get("direction", "")
+        if direction == "LOADING":
+            bucket["loading"] += 1
+        elif direction == "UNLOADING":
+            bucket["unloading"] += 1
+
+    def get_counts(self, camera_id: str) -> dict[str, int]:
+        return dict(self._counts.get(camera_id, {"loading": 0, "unloading": 0}))
+
+    def get_summary(self) -> dict:
+        """Return plant-level totals across all cameras."""
+        total_loading = sum(v["loading"] for v in self._counts.values())
+        total_unloading = sum(v["unloading"] for v in self._counts.values())
+        online = sum(
+            1 for c in self._cameras.values() if c.get("status") == "ONLINE"
+        )
+        return {
+            "online_cameras": online,
+            "total_cameras": len(self._cameras),
+            "today_total": total_loading + total_unloading,
+            "loading_count": total_loading,
+            "unloading_count": total_unloading,
+            "active_sessions": 0,  # Phase 4 wires session tracking
+        }
 
     # ------------------------------------------------------------------
     # Worker lifecycle

@@ -20,11 +20,13 @@ async def _drain_event_queue() -> None:
                 kind = event.get("type", "unknown")
                 cam = event.get("camera_id", "?")
                 if kind == "throughput":
+                    counts = f"  L={event.get('loading',0)} U={event.get('unloading',0)}"
                     print(
                         f"[{cam}] throughput: "
                         f"capture={event['capture_fps']} fps  "
                         f"consume={event['consume_fps']} fps  "
                         f"drop={event['drop_rate']:.1%}"
+                        f"{counts}"
                     )
                 elif kind == "camera_status":
                     status = event.get("status")
@@ -32,6 +34,12 @@ async def _drain_event_queue() -> None:
                     src_fps = event.get("source_fps", "")
                     suffix = f" @ {src_fps} fps" if src_fps else ""
                     print(f"[{cam}] status → {status}{suffix}")
+                elif kind == "count_event":
+                    worker_manager.on_count_event(event)
+                    print(
+                        f"[{cam}] count: {event['direction']}  "
+                        f"track={event['track_id']}"
+                    )
                 else:
                     print(f"[event] {event}")
         except Exception:

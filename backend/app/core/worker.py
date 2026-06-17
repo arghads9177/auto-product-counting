@@ -68,13 +68,14 @@ def _worker_run(
     frame_queue: multiprocessing.Queue,
     stop_event: MpEvent,
 ) -> None:
-    """Process entry point — detect, track, annotate, stream."""
-    # Child-process imports to avoid re-importing in the parent after fork.
+    """Process entry point — detect, track, count, annotate, stream."""
     import supervision as sv
     from app.config import settings
     from app.core.frame_reader import FrameReader
     from app.core.detector import YOLODetector, COCO_TARGET_CLASSES
     from app.core.tracker import ByteTracker
+    from app.core.counter import DualLineCounter
+    from app.core.zones import DEFAULT_LINE_A, DEFAULT_LINE_B
 
     reader = FrameReader(source, target_width=settings.MJPEG_FRAME_WIDTH)
     if not reader.open():
@@ -99,8 +100,25 @@ def _worker_run(
 
     tracker = ByteTracker(frame_rate=source_fps)
 
+    # Grab one frame to get pixel dimensions before creating line zones.
+    frame_w = settings.MJPEG_FRAME_WIDTH
+    frame_h = 480
+    for _ in range(50):  # wait up to ~0.25 s
+        ok, seed_frame = reader.read()
+        if ok:
+            frame_h, frame_w = seed_frame.shape[:2]
+            break
+        time.sleep(0.005)
+
+    # Build sv.LineZone instances from default normalized config.
+    # Phase 5 will replace these with values loaded from camera_configurations.
+    lz_a = DEFAULT_LINE_A.to_sv_line_zone(frame_w, frame_h)
+    lz_b = DEFAULT_LINE_B.to_sv_line_zone(frame_w, frame_h)
+    counter = DualLineCounter(lz_a, lz_b)
+
     box_annotator = sv.BoxAnnotator()
     label_annotator = sv.LabelAnnotator()
+    line_annotator = sv.LineZoneAnnotator(thickness=2)
 
     detect_every = settings.DETECT_EVERY_N_FRAMES
     mjpeg_quality = settings.MJPEG_QUALITY
@@ -121,6 +139,17 @@ def _worker_run(
             raw = detector.detect(frame)
             last_detections = tracker.update(raw)
 
+            new_events = counter.update(last_detections)
+            for ev in new_events:
+                event_queue.put({
+                    "type": "count_event",
+                    "camera_id": camera_id,
+                    "track_id": ev["track_id"],
+                    "direction": ev["direction"],
+                    "timestamp": ev["timestamp"],
+                    "session_id": None,  # Phase 4 wires sessions
+                })
+
         annotated = frame.copy()
         if len(last_detections) > 0:
             labels = [
@@ -132,6 +161,10 @@ def _worker_run(
             annotated = box_annotator.annotate(annotated, last_detections)
             annotated = label_annotator.annotate(annotated, last_detections, labels=labels)
 
+        # Draw counting lines with live in/out counts.
+        line_annotator.annotate(annotated, line_counter=lz_a)
+        line_annotator.annotate(annotated, line_counter=lz_b)
+
         ok_enc, buf = cv2.imencode(
             ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, mjpeg_quality]
         )
@@ -140,6 +173,7 @@ def _worker_run(
 
         if frame_idx % stats_interval == 0:
             s = reader.stats
+            counts = counter.get_counts()
             event_queue.put({
                 "type": "throughput",
                 "camera_id": camera_id,
@@ -148,6 +182,8 @@ def _worker_run(
                 "capture_fps": round(s.capture_fps, 2),
                 "consume_fps": round(s.consume_fps, 2),
                 "drop_rate": round(s.drop_rate, 3),
+                "loading": counts["loading"],
+                "unloading": counts["unloading"],
             })
 
     reader.release()

@@ -17,6 +17,8 @@ class _WorkerManager:
         self._cameras: dict[str, dict] = {}   # camera_id → metadata dict
         self._workers: dict[str, CameraWorker] = {}
         self._queue: multiprocessing.Queue = multiprocessing.Queue()
+        # Per-camera MJPEG frame queues (maxsize=2 for drop-to-latest semantics)
+        self._frame_queues: dict[str, multiprocessing.Queue] = {}
 
     @property
     def event_queue(self) -> multiprocessing.Queue:
@@ -64,6 +66,10 @@ class _WorkerManager:
     # Worker lifecycle
     # ------------------------------------------------------------------
 
+    def get_frame_queue(self, camera_id: str) -> Optional[multiprocessing.Queue]:
+        """Return the MJPEG frame queue for *camera_id*, or None if unknown."""
+        return self._frame_queues.get(camera_id)
+
     def start(self, camera_id: str) -> tuple[bool, str]:
         """Start a worker for *camera_id*. Returns (success, message)."""
         if camera_id not in self._cameras:
@@ -72,7 +78,8 @@ class _WorkerManager:
             return False, f"Worker for '{camera_id}' already running"
 
         source = self._cameras[camera_id]["source"]
-        worker = CameraWorker(camera_id, source, self._queue)
+        fq = self._frame_queues.setdefault(camera_id, multiprocessing.Queue(maxsize=2))
+        worker = CameraWorker(camera_id, source, self._queue, fq)
         worker.start()
         self._workers[camera_id] = worker
         self.update_status(camera_id, "ONLINE")

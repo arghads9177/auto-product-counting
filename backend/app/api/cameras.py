@@ -1,7 +1,9 @@
 """Camera management endpoints."""
-from fastapi import APIRouter, HTTPException
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from app.core.worker_manager import worker_manager
+from app.auth.auth import require_role
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
@@ -26,7 +28,10 @@ async def list_cameras() -> dict:
 
 
 @router.post("")
-async def add_camera(body: AddCameraRequest) -> dict:
+async def add_camera(
+    body: AddCameraRequest,
+    _user: dict = Depends(require_role("ADMIN")),
+) -> dict:
     """Register an RTSP camera (admin only)."""
     if worker_manager.get_camera(body.camera_id):
         raise HTTPException(status_code=409, detail=f"Camera '{body.camera_id}' already exists")
@@ -36,6 +41,24 @@ async def add_camera(body: AddCameraRequest) -> dict:
         source=body.rtsp_url,
         source_type="rtsp",
     )
+    from app.db.mongo import mongo_connection
+    db = mongo_connection.db
+    if db is not None:
+        try:
+            await db["cameras"].update_one(
+                {"camera_id": body.camera_id},
+                {"$set": {
+                    "camera_id": body.camera_id,
+                    "name": body.name,
+                    "rtsp_url": body.rtsp_url,
+                    "status": "OFFLINE",
+                    "enabled": True,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }},
+                upsert=True,
+            )
+        except Exception:
+            pass
     return meta
 
 
@@ -44,16 +67,65 @@ async def get_camera_config(camera_id: str) -> dict:
     """Get camera zone/line/threshold configuration."""
     if not worker_manager.get_camera(camera_id):
         raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found")
-    # Phase 5 will return real config from MongoDB; stub for now.
-    return {"camera_id": camera_id, "zones": {}, "lines": {}, "thresholds": {}}
+
+    from app.db.mongo import mongo_connection
+    db = mongo_connection.db
+    if db is not None:
+        doc = await db["camera_configurations"].find_one(
+            {"camera_id": camera_id}, {"_id": 0}
+        )
+        if doc:
+            return doc
+
+    return {
+        "camera_id": camera_id,
+        "zones": {},
+        "lines": {
+            "A": [[0.0, 0.35], [1.0, 0.35]],
+            "B": [[0.0, 0.65], [1.0, 0.65]],
+        },
+        "direction_map": {"loading": "A->B", "unloading": "B->A"},
+        "thresholds": {
+            "activity_start_sec": 10,
+            "session_idle_end_sec": 300,
+            "min_confidence": 0.4,
+        },
+    }
 
 
 @router.put("/{camera_id}/config")
-async def update_camera_config(camera_id: str, config: UpdateConfigRequest) -> dict:
+async def update_camera_config(
+    camera_id: str,
+    config: UpdateConfigRequest,
+    _user: dict = Depends(require_role("ADMIN", "SUPERVISOR")),
+) -> dict:
     """Update camera zone/line/threshold configuration."""
     if not worker_manager.get_camera(camera_id):
         raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found")
-    # Phase 5 will persist this to MongoDB.
+
+    from app.db.mongo import mongo_connection
+    db = mongo_connection.db
+    if db is not None:
+        update_doc = {
+            "camera_id": camera_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if config.zones:
+            update_doc["zones"] = config.zones
+        if config.lines:
+            update_doc["lines"] = config.lines
+        if config.direction_map:
+            update_doc["direction_map"] = config.direction_map
+        if config.thresholds:
+            update_doc["thresholds"] = config.thresholds
+
+        await db["camera_configurations"].update_one(
+            {"camera_id": camera_id},
+            {"$set": update_doc, "$inc": {"version": 1}},
+            upsert=True,
+        )
+        return {"updated": True, "camera_id": camera_id}
+
     return {"updated": True, "camera_id": camera_id}
 
 

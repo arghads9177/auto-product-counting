@@ -76,6 +76,7 @@ def _worker_run(
     from app.core.tracker import ByteTracker
     from app.core.counter import DualLineCounter
     from app.core.zones import DEFAULT_LINE_A, DEFAULT_LINE_B
+    from app.core.activity import ActivityFSM, FSMConfig
 
     reader = FrameReader(source, target_width=settings.MJPEG_FRAME_WIDTH)
     if not reader.open():
@@ -116,6 +117,11 @@ def _worker_run(
     lz_b = DEFAULT_LINE_B.to_sv_line_zone(frame_w, frame_h)
     counter = DualLineCounter(lz_a, lz_b)
 
+    fsm = ActivityFSM(camera_id, FSMConfig(
+        activity_start_sec=10.0,
+        session_idle_end_sec=300.0,
+    ))
+
     box_annotator = sv.BoxAnnotator()
     label_annotator = sv.LabelAnnotator()
     line_annotator = sv.LineZoneAnnotator(thickness=2)
@@ -126,12 +132,45 @@ def _worker_run(
     frame_idx = 0
     stats_interval = 100
     last_detections: sv.Detections = sv.Detections.empty()
+    consecutive_failures = 0
+    max_failures_before_reconnect = 150  # ~0.75s at 5ms sleep
 
     while not stop_event.is_set():
         ok, frame = reader.read()
         if not ok:
-            time.sleep(0.005)
+            consecutive_failures += 1
+            if consecutive_failures >= max_failures_before_reconnect:
+                event_queue.put({
+                    "type": "camera_status",
+                    "camera_id": camera_id,
+                    "status": "BUFFERING",
+                })
+                reader.release()
+                for attempt in range(5):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(2.0)
+                    if reader.open():
+                        event_queue.put({
+                            "type": "camera_status",
+                            "camera_id": camera_id,
+                            "status": "ONLINE",
+                        })
+                        consecutive_failures = 0
+                        break
+                else:
+                    event_queue.put({
+                        "type": "camera_status",
+                        "camera_id": camera_id,
+                        "status": "ERROR",
+                        "message": "Reconnection failed after 5 attempts",
+                    })
+                    break
+            else:
+                time.sleep(0.005)
             continue
+
+        consecutive_failures = 0
 
         frame_idx += 1
 
@@ -140,6 +179,20 @@ def _worker_run(
             last_detections = tracker.update(raw)
 
             new_events = counter.update(last_detections)
+
+            # Feed FSM with current detections and count events
+            fsm_events = fsm.update(
+                class_ids=last_detections.class_id,
+                new_count_events=new_events,
+            )
+
+            for ev in fsm_events:
+                event_queue.put(ev)
+                if ev.get("kind") == "session_end":
+                    counter.reset()
+
+            session_id = fsm.current_session_id
+
             for ev in new_events:
                 event_queue.put({
                     "type": "count_event",
@@ -147,7 +200,7 @@ def _worker_run(
                     "track_id": ev["track_id"],
                     "direction": ev["direction"],
                     "timestamp": ev["timestamp"],
-                    "session_id": None,  # Phase 4 wires sessions
+                    "session_id": session_id,
                 })
 
         annotated = frame.copy()
@@ -185,6 +238,9 @@ def _worker_run(
                 "loading": counts["loading"],
                 "unloading": counts["unloading"],
             })
+
+    for ev in fsm.force_complete():
+        event_queue.put(ev)
 
     reader.release()
     detector.unload()

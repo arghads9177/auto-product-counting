@@ -21,6 +21,10 @@ class _WorkerManager:
         self._frame_queues: dict[str, multiprocessing.Queue] = {}
         # In-memory count totals per camera; Phase 5 adds MongoDB persistence
         self._counts: dict[str, dict[str, int]] = {}  # camera_id → {loading, unloading}
+        # Active sessions: session_id → session info dict
+        self._sessions: dict[str, dict] = {}
+        # camera_id → active session_id (at most one per camera)
+        self._camera_sessions: dict[str, str] = {}
 
     @property
     def event_queue(self) -> multiprocessing.Queue:
@@ -76,8 +80,41 @@ class _WorkerManager:
         elif direction == "UNLOADING":
             bucket["unloading"] += 1
 
+        sid = event.get("session_id")
+        if sid and sid in self._sessions:
+            self._sessions[sid]["count"] += 1
+
     def get_counts(self, camera_id: str) -> dict[str, int]:
         return dict(self._counts.get(camera_id, {"loading": 0, "unloading": 0}))
+
+    def on_activity_event(self, event: dict) -> None:
+        """Handle session_start / session_end from the Activity FSM."""
+        kind = event.get("kind")
+        camera_id = event.get("camera_id")
+        session_id = event.get("session_id")
+        payload = event.get("payload", {})
+
+        if kind == "session_start":
+            info = {
+                "session_id": session_id,
+                "camera_id": camera_id,
+                "session_type": payload.get("session_type"),
+                "start_time": payload.get("start_time"),
+                "count": 0,
+            }
+            self._sessions[session_id] = info
+            self._camera_sessions[camera_id] = session_id
+        elif kind == "session_end":
+            self._sessions.pop(session_id, None)
+            if self._camera_sessions.get(camera_id) == session_id:
+                self._camera_sessions.pop(camera_id, None)
+
+    def get_active_sessions(self) -> list[dict]:
+        return list(self._sessions.values())
+
+    def get_camera_session(self, camera_id: str) -> dict | None:
+        sid = self._camera_sessions.get(camera_id)
+        return self._sessions.get(sid) if sid else None
 
     def get_summary(self) -> dict:
         """Return plant-level totals across all cameras."""
@@ -92,7 +129,7 @@ class _WorkerManager:
             "today_total": total_loading + total_unloading,
             "loading_count": total_loading,
             "unloading_count": total_unloading,
-            "active_sessions": 0,  # Phase 4 wires session tracking
+            "active_sessions": len(self._sessions),
         }
 
     # ------------------------------------------------------------------
@@ -109,6 +146,11 @@ class _WorkerManager:
             return False, f"Camera '{camera_id}' not registered"
         if self.is_running(camera_id):
             return False, f"Worker for '{camera_id}' already running"
+
+        from app.config import settings
+        running_count = sum(1 for w in self._workers.values() if w.process and w.process.is_alive())
+        if running_count >= settings.MAX_CONCURRENT_CAMERAS:
+            return False, f"Max concurrent cameras ({settings.MAX_CONCURRENT_CAMERAS}) reached"
 
         source = self._cameras[camera_id]["source"]
         fq = self._frame_queues.setdefault(camera_id, multiprocessing.Queue(maxsize=2))
